@@ -84,7 +84,7 @@ class KnowledgeLayer(nn.Module):
         return output
 
     def _scatter_backward(self, x: torch.Tensor, reduce: str):
-        output = torch.empty(self.in_shape, dtype=x.dtype, device=x.device)
+        output = torch.zeros(self.in_shape, dtype=x.dtype, device=x.device)
         output = torch.scatter_reduce(output, 0, index=self.ix_in, src=x, reduce=reduce, include_self=False)
         return output
 
@@ -134,7 +134,7 @@ class SumLayer(KnowledgeLayer):
         return self._scatter_forward(x[self.ix_in], "sum")
 
     def sample_pc(self, y):
-        return self._scatter_backward(y[self.ix_out], "sum") > 0
+        return self._scatter_backward(y[self.ix_out], "amax")
 
 
 class ProdLayer(KnowledgeLayer):
@@ -142,7 +142,7 @@ class ProdLayer(KnowledgeLayer):
         return self._scatter_forward(x[self.ix_in], "prod")
 
     def sample_pc(self, y):
-        return self._scatter_backward(y[self.ix_out], "sum") > 0
+        return self._scatter_backward(y[self.ix_out], "amax")
 
 
 class MinLayer(KnowledgeLayer):
