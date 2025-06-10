@@ -35,7 +35,7 @@ class KnowledgeModule(nn.Module):
         self.probabilistic = probabilistic
         sum_layer, prod_layer, self.zero, self.one, self.negate = get_semiring(semiring, probabilistic)
         for i, (ix_in, ix_out) in enumerate(zip(ixs_in, ixs_out)):
-            ix_in = torch.as_tensor(ix_in)
+            ix_in = torch.as_tensor(ix_in, dtype=torch.long)
             ix_out = torch.as_tensor(ix_out, dtype=torch.long)
             ix_out = unroll_ixs(ix_out)
             if i % 2 == 0:
@@ -150,7 +150,6 @@ class SumLayer(KnowledgeLayer):
 
 class ProdLayer(KnowledgeLayer):
     def forward(self, x):
-        print("prod", x)
         return self._scatter_forward(x[self.ix_in], "prod")
 
     def sample_pc(self, y):
