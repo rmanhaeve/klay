@@ -22,12 +22,6 @@ def negate_real(x, eps):
     return 1 - x
 
 
-def encode_input(pos, neg, zero, one):
-    result = torch.stack([pos, neg], dim=1).flatten()
-    constants = torch.tensor([zero, one], dtype=torch.float32, device=pos.device)
-    return torch.cat([constants, result])
-
-
 def unroll_ixs(ixs):
     deltas = torch.diff(ixs)
     ixs = torch.arange(len(deltas), dtype=torch.long, device=ixs.device)
@@ -50,11 +44,16 @@ class KnowledgeModule(nn.Module):
                 layers.append(sum_layer(ix_in, ix_out))
         self.layers = nn.Sequential(*layers)
 
-    def forward(self, weights, neg_weights=None, eps=0):
-        if neg_weights is None:
-            neg_weights = self.negate(weights, eps)
-        x = encode_input(weights, neg_weights, self.zero, self.one)
+    def forward(self, x_pos, x_neg=None, eps=0):
+        x = self.encode_input(x_pos, x_neg, eps)
         return self.layers(x)
+
+    def encode_input(self, pos, neg, eps):
+        if neg is None:
+            neg = self.negate(pos, eps)
+        x = torch.stack([pos, neg], dim=1).flatten()
+        units = torch.tensor([self.zero, self.one], dtype=torch.float32, device=pos.device)
+        return torch.cat([units, x])
 
     def sparsity(self, nb_vars: int) -> float:
         sparse_params = sum(len(l.ix_out) for l in self.layers)
@@ -68,6 +67,15 @@ class KnowledgeModule(nn.Module):
         for layer in reversed(self.layers):
             y = layer.sample_pc(y)
         return y[2::2]
+
+    def condition_pc(self, x_pos, x_neg):
+        assert self.probabilistic
+        x = self.encode_input(x_pos, x_neg, None)
+        for layer in self.layers:
+            x = layer.condition_pc(x) \
+                if isinstance(layer, ProbabilisticKnowledgeLayer) \
+                else layer(x)
+        return x
 
 
 class KnowledgeLayer(nn.Module):
@@ -87,7 +95,6 @@ class KnowledgeLayer(nn.Module):
         output = torch.zeros(self.in_shape, dtype=x.dtype, device=x.device)
         output = torch.scatter_reduce(output, 0, index=self.ix_in, src=x, reduce=reduce, include_self=False)
         return output
-
 
     def _safe_exp(self, x: torch.Tensor):
         with torch.no_grad():
@@ -115,6 +122,10 @@ class ProbabilisticKnowledgeLayer(KnowledgeLayer):
         norm = self._scatter_forward(exp_weights, "sum")
         return exp_weights / norm[self.ix_out]
 
+    def renorm_weights(self, x):
+        with torch.no_grad():
+            self.weights.data = self.get_log_edge_weights(0) + x
+
     def get_log_edge_weights(self, eps):
         norm = self._logsumexp_scatter(self.weights, eps)
         return self.weights - norm[self.ix_out]
@@ -139,6 +150,7 @@ class SumLayer(KnowledgeLayer):
 
 class ProdLayer(KnowledgeLayer):
     def forward(self, x):
+        print("prod", x)
         return self._scatter_forward(x[self.ix_in], "prod")
 
     def sample_pc(self, y):
@@ -165,12 +177,21 @@ class ProbabilisticSumLayer(ProbabilisticKnowledgeLayer):
         x = self.get_edge_weights() * x[self.ix_in]
         return self._scatter_forward(x, "sum")
 
+    def condition_pc(self, x):
+        x2 = self.forward(x)
+        self.renorm_weights(x[self.ix_in].log())
+        return x2
+
 
 class ProbabilisticLogSumLayer(ProbabilisticKnowledgeLayer):
     def forward(self, x, eps=10e-16):
         x = self.get_log_edge_weights(eps) + x[self.ix_in]
         return self._logsumexp_scatter(x, eps)
 
+    def condition_pc(self, x):
+        y = self.forward(x)
+        self.renorm_weights(x[self.ix_in])
+        return y
 
 def get_semiring(name: str, probabilistic: bool):
     """

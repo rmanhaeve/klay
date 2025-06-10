@@ -33,6 +33,20 @@ def test_probabilistic():
     expected_result = torch.tensor((0.4/2 + 0.2/2) * (0.2/2 + 0.5/2))
     assert torch.allclose(m(weights), expected_result)
 
+def test_pc_conditioning():
+    c = klay.Circuit()
+    p1, p2 = c.literal_node(1), c.literal_node(2)
+    n1, n2 = c.literal_node(-1), c.literal_node(-2)
+    and_node1 = c.and_node([p1, p2])
+    and_node2 = c.and_node([n1, n2])
+    or_node = c.or_node([and_node1, and_node2])
+    c.set_root(or_node)
+
+    m = c.to_torch_module(semiring='real', probabilistic=True)
+    m.condition_pc(torch.tensor([1,1]), torch.tensor([1,0]))
+    for _ in range(20):
+        assert torch.allclose(m.sample_pc(), torch.tensor([True, True]))
+
 def test_log_probabilistic():
     c = klay.Circuit()
     l1, l2, l3 = c.literal_node(1), c.literal_node(-2), c.literal_node(3)
