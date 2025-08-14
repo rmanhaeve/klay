@@ -2,7 +2,7 @@ import argparse
 
 import klay
 import numpy as np
-from klay.utils import benchmark_klay_jax, benchmark_klay_torch, benchmark_sdd_torch_naive
+from klay.utils import benchmark_klay_torch, benchmark_sdd_torch_naive
 from pysdd.sdd import SddManager, Vtree
 
 
