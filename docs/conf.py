@@ -20,7 +20,8 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "sphinx.ext.intersphinx",
-    "sphinx_inline_tabs"
+    "sphinx_inline_tabs",
+    "sphinx_copybutton",
 ]
 
 templates_path = ['_templates']
