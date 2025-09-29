@@ -19,12 +19,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-torch = [
-    "torch",
-]
-jax = [
-    "jax",
-]
+torch = ["torch"]
+jax = ["jax"]
 
 
 [project.urls]
@@ -43,6 +39,9 @@ build-dir = "build/{wheel_tag}"
 wheel.py-api = "cp312"
 
 wheel.packages = ["src/klay"]
+
+# Include CMakeLists.txt in source distribution
+sdist.include = ["CMakeLists.txt"]
 
 #[tool.cibuildwheel]
 ## Necessary to see build output from the actual compilation
