@@ -1,10 +1,13 @@
+[![Python 3.10](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/release/python-3100/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Build](https://github.com/ML-KULeuven/klay/actions/workflows/main.yml/badge.svg)](https://github.com/ML-KULeuven/klay/actions/workflows/main.yml)
+
 # KLay
 
-[[🎥 Video](https://www.youtube.com/watch?v=ZCpDenbGoJ4)] [[📃 Paper](https://openreview.net/pdf?id=Zes7Wyif8G)] [[📖 Documentation](https://klaycircuits.readthedocs.io/en/latest/)]
 
 _KLay is a Python library for evaluating sparse circuits on the GPU._
 
-To get started, install KLay using pip and check out the [documentation](https://klaycircuits.readthedocs.io/en/latest/).
+To get started, install KLay using pip and check out the [documentation](https://klaycircuits.readthedocs.io/en/latest/). You can also refer to [this video](https://www.youtube.com/watch?v=ZCpDenbGoJ4) or [the paper](https://openreview.net/pdf?id=Zes7Wyif8G) for more details.
 
 ```bash
 pip install klaycircuits
