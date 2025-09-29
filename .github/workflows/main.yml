@@ -67,5 +67,5 @@ jobs:
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages_dir: dist/
-          skip_existing: true
+          packages-dir: dist/
+          skip-existing: true
