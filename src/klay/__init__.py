@@ -10,9 +10,9 @@ def to_torch_module(self: Circuit, semiring: str = "log", probabilistic: bool = 
     Convert the circuit into a PyTorch module.
 
     :param semiring:
-        The semiring in which the circuit should be evaluated. Supported options are ("log", "real", "mpe", "godel").
+        The semiring in which the circuit should be evaluated. Supported options are :code:`"log"`, :code:`"real"`, :code:`"mpe"`, or :code:`"godel"`.
     :param probabilistic:
-        If true, construct a probabilistic circuit instead of an arithmetic circuit.
+        If enabled, construct a probabilistic circuit instead of an arithmetic circuit.
         This means the inputs to a sum node are multiplied by a probability, and
         we can interpret sum nodes as latent Categorical variables.
     """
@@ -26,28 +26,33 @@ def to_jax_function(self: Circuit, semiring: str = "log"):
     Convert the circuit into a Jax function.
 
     :param semiring:
-        The semiring in which the circuit should be evaluated. Supported options are ("log", "real", "mpe", "godel").
+        The semiring in which the circuit should be evaluated. Supported options are :code:`"log"`, :code:`"real"`, :code:`"mpe"`, or :code:`"godel"`.
     """
     from .jax import create_knowledge_layer
     indices = self._get_indices()
     return create_knowledge_layer(*indices, semiring=semiring)
 
 
-def add_sdd(self: Circuit, sdd: "SddNode", true_lits: Sequence[int] = (), false_lits: Sequence[int] = ()):
+def add_sdd(self: Circuit, sdd: "SddNode", true_lits: Sequence[int] = (), false_lits: Sequence[int] = ()) -> NodePtr:
     """
     Add an SDD to the Circuit.
 
+    :param sdd:
+        PySDD `SDDNode`_ to be added.
     :param true_lits:
         List of literals that are always true and should get propagated away.
     :param false_lits:
         List of literals that are always false and should get propagated away.
+
+    .. _SDDNode: https://pysdd.readthedocs.io/en/latest/classes/SddNode.html
     """
     import os
     from pathlib import Path
 
     sdd.save(bytes(Path("tmp.sdd")))
-    self.add_sdd_from_file("tmp.sdd", true_lits, false_lits)
+    root = self.add_sdd_from_file("tmp.sdd", true_lits, false_lits)
     os.remove("tmp.sdd")
+    return root
 
 
 Circuit.to_torch_module = to_torch_module
