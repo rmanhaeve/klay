@@ -96,7 +96,7 @@ def get_circuit(grid_size: int):
 
 
 def nll_loss(preds, targets):
-    neg_preds = klay.torch.log1mexp(preds, eps=1e-7)
+    neg_preds = klay.torch.utils.log1mexp(preds)
     nll = -torch.where(targets, preds, neg_preds)
     return nll.mean()
 
@@ -130,7 +130,7 @@ def evaluate(model, dataloader, device="cuda"):
 def main(grid_size: int, batch_size: int, nb_epochs: int, learning_rate: float, device="cuda"):
     train_dataloader = get_dataloader(grid_size, "train", batch_size)
     model = VisualSudokuModule(grid_size).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-7)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-6)
     timings = []
 
     for epoch in range(nb_epochs):
@@ -148,9 +148,9 @@ def main(grid_size: int, batch_size: int, nb_epochs: int, learning_rate: float, 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-b', '--batch_size', type=int, default=1)
-    parser.add_argument('-e', '--nb_epochs', type=int, default=10)
+    parser.add_argument('-e', '--nb_epochs', type=int, default=20)
     parser.add_argument('-d', '--device', default='cpu')
-    parser.add_argument('-lr', '--learning_rate', type=float, default=0.001)
+    parser.add_argument('-lr', '--learning_rate', type=float, default=0.0003)
     args = parser.parse_args()
 
     main(
