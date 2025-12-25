@@ -4,6 +4,7 @@ NodePtr.__module__ = "klay"
 
 from collections.abc import Sequence
 import tempfile
+import os
 from pathlib import Path
 
 
@@ -52,9 +53,16 @@ def add_sdd(self: Circuit, sdd: "SddNode", true_lits: Sequence[int] = (), false_
 
     .. _SDDNode: https://pysdd.readthedocs.io/en/latest/classes/SddNode.html
     """
-    with tempfile.NamedTemporaryFile() as tmp:
-        sdd.save(bytes(Path(tmp.name)))
-        return self.add_sdd_from_file(tmp.name, true_lits, false_lits)
+    # Use delete=False for Windows compatibility - the file must be closed
+    # before other processes can access it on Windows
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        sdd.save(bytes(Path(tmp_path)))
+        return self.add_sdd_from_file(tmp_path, true_lits, false_lits)
+    finally:
+        os.unlink(tmp_path)
 
 
 Circuit.to_torch_module = to_torch_module
