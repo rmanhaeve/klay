@@ -1,0 +1,581 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=0.8in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{amsmath}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\scriptsize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2,
+    language=Python
+}
+\lstset{style=mystyle}
+
+\title{Benchmark: \texttt{scatter\_reduce} vs General Scatter + Reduce\\Realistic Workload Analysis}
+\author{Automated Benchmark Report}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report presents performance analysis using fan-in distributions derived from real SDD circuits, with weighted speedups reflecting actual computational workloads. We benchmark both forward and backward passes across four reduction operations (prod, sum, max, min) on CPU and Apple Silicon GPU (MPS). Our findings reveal that the general approach significantly outperforms \texttt{scatter\_reduce} for most operations at scale, with speedups of 2--5$\times$ on CPU and operation-dependent results on MPS.
+\end{abstract}
+
+\section{Introduction}
+
+Scatter-reduce operations are fundamental building blocks in:
+\begin{itemize}
+    \item \textbf{Graph Neural Networks}: Aggregating neighbor features
+    \item \textbf{Sparse Tensor Operations}: Combining values with shared indices
+    \item \textbf{Probabilistic Circuits}: Computing partition functions over knowledge bases
+    \item \textbf{Attention Mechanisms}: Sparse attention patterns
+\end{itemize}
+
+PyTorch provides \texttt{torch.scatter\_reduce} as a fused operation that handles irregular scatter patterns efficiently. However, this operation has inherent overhead from handling variable-length groups and irregular memory access patterns.
+
+An alternative approach is to:
+\begin{enumerate}
+    \item Pre-compute positions within each group (done once, not timed)
+    \item Scatter values to a regular 2D tensor of shape \texttt{(n\_outputs, max\_fan\_in)}
+    \item Apply standard PyTorch reductions along dimension 1
+\end{enumerate}
+
+This general approach trades memory for regularity, potentially enabling better vectorization and cache utilization.
+
+\section{Circuit Characteristics}
+
+To inform our benchmark design, we analyzed the fan-in and fan-out distributions of five real-world SDD (Sentential Decision Diagram) circuits used in neuro-symbolic AI applications.
+
+\begin{table}[H]
+\centering
+\caption{Circuit Statistics: Fan-in and Fan-out Distributions}
+\label{tab:circuit_stats}
+\begin{tabular}{@{}lrrrrrrrrr@{}}
+\toprule
+& & & \multicolumn{3}{c}{\textbf{Fan-in}} & \multicolumn{3}{c}{\textbf{Fan-out}} \\
+\cmidrule(lr){4-6} \cmidrule(lr){7-9}
+\textbf{Circuit} & \textbf{Nodes} & \textbf{D-nodes} & med & p95 & max & med & p95 & max \\
+\midrule
+road\_r & 237 & 153 & 4 & 6 & 8 & 2 & 6 & 86 \\
+sudoku\_4 & 869 & 739 & 4 & 8 & 10 & 2 & 8 & 492 \\
+4-grid & 1,707 & 1,625 & 4 & 18 & 58 & 2 & 18 & 1,217 \\
+seq\_fun & 3,986 & 2,984 & 4 & 6 & 24 & 2 & 6 & 1,638 \\
+warcraft\_12 & 183,018 & 182,488 & 6 & 28 & 228 & 3 & 24 & 171,051 \\
+\midrule
+\textbf{Aggregate} & \textbf{189,817} & \textbf{187,989} & \textbf{6} & \textbf{28} & \textbf{228} & \textbf{3} & \textbf{24} & \textbf{171,051} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{circuit_boxplots.pdf}
+    \caption{Box plots of fan-in (left) and fan-out (right) distributions for each circuit. The y-axis uses log scale. Fan-in represents the number of children per product node; fan-out represents how many parent nodes reference each node.}
+    \label{fig:circuit_boxplots}
+\end{figure}
+
+\textbf{Key observations:}
+\begin{itemize}
+    \item \textbf{Fan-in is modest}: Median fan-in is 4--6 across circuits, with p95 typically under 30
+    \item \textbf{Fan-out is highly skewed}: While median fan-out is 2--3, some nodes (constants, common subexpressions) are referenced 100,000+ times
+    \item \textbf{Scale varies dramatically}: From 237 nodes (road\_r) to 183,018 nodes (warcraft\_12)
+\end{itemize}
+
+These distributions inform our benchmark parameters: fan-in values of 2--50 cover the realistic range, while the high fan-out tail is relevant for backward pass performance.
+
+\section{Computational Environment}
+
+\begin{table}[H]
+\centering
+\caption{Hardware and Software Configuration}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Component} & \textbf{Specification} \\
+\midrule
+CPU & Apple M3 (8 cores) \\
+RAM & 16 GB \\
+GPU & Apple Silicon GPU (MPS) \\
+PyTorch Version & 2.9.1 \\
+Devices Tested & CPU, MPS \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Implementation Details}
+
+\subsection{Approach 1: Fused \texttt{scatter\_reduce}}
+
+The fused approach uses PyTorch's built-in operation:
+
+\begin{lstlisting}
+@torch.jit.script
+def scatter_reduce_prod(x: Tensor, ptrs: Tensor, csr: Tensor, n_outputs: int) -> Tensor:
+    output = torch.empty(n_outputs, dtype=x.dtype, device=x.device)
+    return torch.scatter_reduce(output, 0, index=csr, src=x[ptrs], 
+                                reduce="prod", include_self=False)
+\end{lstlisting}
+
+This operation:
+\begin{itemize}
+    \item Handles irregular group sizes natively
+    \item Memory-efficient (no padding required)
+    \item Has fully implemented backward pass for all reduce operations
+\end{itemize}
+
+\subsection{Approach 2: General Scatter + Reduce}
+
+The general approach uses a pre-allocated 2D buffer:
+
+\begin{lstlisting}
+@torch.jit.script
+def general_prod(x: Tensor, ptrs: Tensor, csr: Tensor, 
+                 positions: Tensor, scattered: Tensor) -> Tensor:
+    # scattered buffer and positions are pre-allocated (not timed)
+    scattered.fill_(1.0)
+    scattered[csr, positions] = x[ptrs]
+    return torch.prod(scattered, dim=1)
+\end{lstlisting}
+
+Key optimizations:
+\begin{itemize}
+    \item \textbf{Pre-computed positions}: Group positions calculated once before benchmarking
+    \item \textbf{Pre-allocated buffer}: The \texttt{scattered} tensor is allocated once and reused
+    \item Only \texttt{fill\_()}, indexed assignment, and reduction are timed
+\end{itemize}
+
+\subsection{Benchmark Methodology}
+
+\begin{itemize}
+    \item \textbf{Warmup}: 10 iterations before timing
+    \item \textbf{Iterations}: 20 timed iterations per configuration
+    \item \textbf{Synchronization}: \texttt{torch.mps.synchronize()} / \texttt{torch.cuda.synchronize()} for accurate GPU timing
+    \item \textbf{Fan-in}: Fixed at 10 inputs per output (uniform distribution)
+    \item \textbf{Scale}: $10^2$ to $10^6$ outputs
+\end{itemize}
+
+\section{Results}
+
+\subsection{CPU Results}
+
+\begin{table}[H]
+\centering
+\caption{Forward and Backward Pass Results on CPU (times in ms, varied)}
+\label{tab:results_cpu}
+\footnotesize
+\begin{tabular}{@{}rlrrrrrr@{}}
+\toprule
+Fan-in & op & scat\_fwd & gen\_fwd & fwd\_spd & scat\_bwd & gen\_bwd & bwd\_spd \\
+\midrule
+        4 & prod & 0.048 & 0.034 & 0.71 & 0.166 & 0.085 & 0.51 \\
+        4 & sum & 0.033 & 0.036 & 1.08 & 0.061 & 0.090 & 1.46 \\
+        4 & max & 0.045 & 0.047 & 1.03 & 0.110 & 0.100 & 0.91 \\
+        4 & min & 0.044 & 0.045 & 1.02 & 0.110 & 0.100 & 0.91 \\
+        6 & prod & 0.056 & 0.040 & 0.71 & 0.207 & 0.108 & 0.52 \\
+        6 & sum & 0.038 & 0.042 & 1.10 & 0.066 & 0.095 & 1.44 \\
+        6 & max & 0.064 & 0.051 & 0.80 & 0.142 & 0.107 & 0.75 \\
+        6 & min & 0.069 & 0.048 & 0.70 & 0.151 & 0.108 & 0.72 \\
+        8 & prod & 0.073 & 0.042 & 0.57 & 0.278 & 0.108 & 0.39 \\
+        8 & sum & 0.047 & 0.042 & 0.89 & 0.082 & 0.098 & 1.20 \\
+        8 & max & 0.076 & 0.052 & 0.68 & 0.181 & 0.112 & 0.62 \\
+        8 & min & 0.077 & 0.051 & 0.66 & 0.180 & 0.109 & 0.61 \\
+        10 & prod & 0.075 & 0.041 & 0.55 & 0.298 & 0.115 & 0.39 \\
+        10 & sum & 0.042 & 0.043 & 1.02 & 0.080 & 0.109 & 1.37 \\
+        10 & max & 0.095 & 0.049 & 0.52 & 0.208 & 0.120 & 0.58 \\
+        10 & min & 0.096 & 0.051 & 0.53 & 0.205 & 0.113 & 0.55 \\
+        14 & prod & 0.111 & 0.045 & 0.40 & 0.443 & 0.140 & 0.32 \\
+        14 & sum & 0.066 & 0.044 & 0.67 & 0.110 & 0.117 & 1.06 \\
+        14 & max & 0.121 & 0.056 & 0.46 & 0.287 & 0.135 & 0.47 \\
+        14 & min & 0.116 & 0.055 & 0.47 & 0.277 & 0.129 & 0.46 \\
+        20 & prod & 0.152 & 0.047 & 0.31 & 0.613 & 0.157 & 0.26 \\
+        20 & sum & 0.088 & 0.050 & 0.57 & 0.141 & 0.136 & 0.97 \\
+        20 & max & 0.172 & 0.061 & 0.35 & 0.416 & 0.148 & 0.36 \\
+        20 & min & 0.173 & 0.068 & 0.40 & 0.392 & 0.154 & 0.39 \\
+        30 & prod & 0.193 & 0.062 & 0.32 & 0.805 & 0.240 & 0.30 \\
+        30 & sum & 0.097 & 0.080 & 0.83 & 0.190 & 0.197 & 1.04 \\
+        30 & max & 0.259 & 0.073 & 0.28 & 0.544 & 0.198 & 0.36 \\
+        30 & min & 0.253 & 0.072 & 0.28 & 0.549 & 0.198 & 0.36 \\
+        50 & prod & 0.354 & 0.089 & 0.25 & 1.699 & 0.503 & 0.30 \\
+        50 & sum & 0.208 & 0.090 & 0.44 & 0.488 & 0.431 & 0.88 \\
+        50 & max & 0.408 & 0.101 & 0.25 & 1.150 & 0.485 & 0.42 \\
+        50 & min & 0.419 & 0.101 & 0.24 & 1.158 & 0.473 & 0.41 \\
+        4 & prod & 0.292 & 0.089 & 0.31 & 1.437 & 0.492 & 0.34 \\
+        4 & sum & 0.165 & 0.100 & 0.61 & 0.444 & 0.394 & 0.89 \\
+        4 & max & 0.285 & 0.112 & 0.39 & 0.910 & 0.439 & 0.48 \\
+        4 & min & 0.285 & 0.115 & 0.40 & 0.930 & 0.478 & 0.51 \\
+        6 & prod & 0.389 & 0.110 & 0.28 & 1.991 & 0.639 & 0.32 \\
+        6 & sum & 0.214 & 0.114 & 0.53 & 0.543 & 0.559 & 1.03 \\
+        6 & max & 0.451 & 0.137 & 0.30 & 1.374 & 0.696 & 0.51 \\
+        6 & min & 0.464 & 0.139 & 0.30 & 1.284 & 0.583 & 0.45 \\
+        8 & prod & 0.568 & 0.127 & 0.22 & 2.618 & 0.703 & 0.27 \\
+        8 & sum & 0.307 & 0.166 & 0.54 & 0.676 & 0.626 & 0.93 \\
+        8 & max & 0.606 & 0.160 & 0.26 & 1.696 & 0.662 & 0.39 \\
+        8 & min & 0.625 & 0.164 & 0.26 & 1.708 & 0.641 & 0.38 \\
+        10 & prod & 0.591 & 0.146 & 0.25 & 2.853 & 0.848 & 0.30 \\
+        10 & sum & 0.266 & 0.145 & 0.55 & 0.691 & 0.655 & 0.95 \\
+        10 & max & 0.809 & 0.179 & 0.22 & 1.934 & 0.811 & 0.42 \\
+        10 & min & 0.792 & 0.187 & 0.24 & 2.060 & 0.707 & 0.34 \\
+        14 & prod & 1.013 & 0.214 & 0.21 & 4.379 & 1.166 & 0.27 \\
+        14 & sum & 0.573 & 0.191 & 0.33 & 1.089 & 0.891 & 0.82 \\
+        14 & max & 1.035 & 0.223 & 0.22 & 2.760 & 0.911 & 0.33 \\
+        14 & min & 1.024 & 0.234 & 0.23 & 2.788 & 0.903 & 0.32 \\
+        20 & prod & 1.385 & 0.259 & 0.19 & 6.098 & 1.306 & 0.21 \\
+        20 & sum & 0.726 & 0.232 & 0.32 & 1.430 & 1.194 & 0.84 \\
+        20 & max & 1.612 & 0.296 & 0.18 & 4.003 & 1.270 & 0.32 \\
+        20 & min & 1.580 & 0.293 & 0.19 & 4.054 & 1.244 & 0.31 \\
+        30 & prod & 1.739 & 0.324 & 0.19 & 8.155 & 1.836 & 0.23 \\
+        30 & sum & 0.799 & 0.327 & 0.41 & 1.889 & 1.504 & 0.80 \\
+        30 & max & 2.421 & 0.591 & 0.24 & 6.330 & 2.251 & 0.36 \\
+        30 & min & 2.429 & 0.400 & 0.16 & 5.698 & 22.579 & 3.96 \\
+        50 & prod & 3.584 & 0.584 & 0.16 & 15.708 & 3.511 & 0.22 \\
+        50 & sum & 1.863 & 0.563 & 0.30 & 3.511 & 2.569 & 0.73 \\
+        50 & max & 4.087 & 0.656 & 0.16 & 9.773 & 2.771 & 0.28 \\
+        50 & min & 4.019 & 0.667 & 0.17 & 10.208 & 2.826 & 0.28 \\
+        4 & prod & 2.786 & 0.470 & 0.17 & 13.825 & 4.311 & 0.31 \\
+        4 & sum & 1.609 & 0.684 & 0.43 & 3.330 & 2.519 & 0.76 \\
+        4 & max & 2.675 & 0.866 & 0.32 & 7.856 & 2.871 & 0.37 \\
+        4 & min & 2.921 & 0.761 & 0.26 & 8.055 & 2.967 & 0.37 \\
+        6 & prod & 3.901 & 0.773 & 0.20 & 17.707 & 4.426 & 0.25 \\
+        6 & sum & 2.139 & 0.813 & 0.38 & 4.003 & 3.197 & 0.80 \\
+        6 & max & 4.476 & 1.213 & 0.27 & 11.877 & 4.537 & 0.38 \\
+        6 & min & 4.498 & 1.083 & 0.24 & 11.502 & 3.645 & 0.32 \\
+        8 & prod & 5.646 & 0.979 & 0.17 & 24.713 & 5.440 & 0.22 \\
+        8 & sum & 3.047 & 1.009 & 0.33 & 5.834 & 4.341 & 0.74 \\
+        8 & max & 6.080 & 1.353 & 0.22 & 15.585 & 4.918 & 0.32 \\
+        8 & min & 6.332 & 1.323 & 0.21 & 15.837 & 4.869 & 0.31 \\
+        10 & prod & 5.915 & 1.259 & 0.21 & 28.470 & 6.455 & 0.23 \\
+        10 & sum & 3.031 & 1.349 & 0.45 & 7.072 & 5.496 & 0.78 \\
+        10 & max & 8.083 & 1.838 & 0.23 & 18.867 & 5.852 & 0.31 \\
+        10 & min & 8.073 & 1.766 & 0.22 & 18.842 & 5.925 & 0.31 \\
+        14 & prod & 9.965 & 1.750 & 0.18 & 42.908 & 8.952 & 0.21 \\
+        14 & sum & 6.450 & 2.122 & 0.33 & 9.896 & 7.004 & 0.71 \\
+        14 & max & 10.789 & 2.577 & 0.24 & 26.979 & 8.125 & 0.30 \\
+        14 & min & 10.380 & 2.292 & 0.22 & 26.816 & 7.627 & 0.28 \\
+        20 & prod & 14.240 & 2.807 & 0.20 & 61.946 & 11.870 & 0.19 \\
+        20 & sum & 7.730 & 2.526 & 0.33 & 13.814 & 9.489 & 0.69 \\
+        20 & max & 16.586 & 3.350 & 0.20 & 39.467 & 11.551 & 0.29 \\
+        20 & min & 16.436 & 3.378 & 0.21 & 40.033 & 11.424 & 0.29 \\
+        30 & prod & 17.889 & 3.538 & 0.20 & 81.035 & 19.943 & 0.25 \\
+        30 & sum & 8.652 & 3.646 & 0.42 & 17.506 & 14.331 & 0.82 \\
+        30 & max & 24.623 & 13.071 & 0.53 & 54.675 & 15.589 & 0.29 \\
+        30 & min & 24.317 & 4.723 & 0.19 & 54.566 & 15.603 & 0.29 \\
+        50 & prod & 39.936 & 12.432 & 0.31 & 160.173 & 39.219 & 0.24 \\
+        50 & sum & 23.577 & 12.709 & 0.54 & 43.327 & 35.028 & 0.81 \\
+        50 & max & 44.963 & 13.492 & 0.30 & 104.474 & 36.223 & 0.35 \\
+        50 & min & 48.240 & 14.325 & 0.30 & 105.328 & 36.724 & 0.35 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{MPS Results}
+
+\begin{table}[H]
+\centering
+\caption{Forward and Backward Pass Results on MPS (times in ms, varied)}
+\label{tab:results_mps}
+\footnotesize
+\begin{tabular}{@{}rlrrrrrr@{}}
+\toprule
+Fan-in & op & scat\_fwd & gen\_fwd & fwd\_spd & scat\_bwd & gen\_bwd & bwd\_spd \\
+\midrule
+        4 & prod & 0.110 & 0.075 & 0.68 & 0.594 & 0.418 & 0.70 \\
+        4 & sum & 0.135 & 0.083 & 0.61 & 0.181 & 0.191 & 1.06 \\
+        4 & max & 0.088 & 0.061 & 0.69 & 0.342 & 0.197 & 0.58 \\
+        4 & min & 0.096 & 0.151 & 1.57 & 0.333 & 0.180 & 0.54 \\
+        6 & prod & 0.111 & 0.114 & 1.03 & 0.518 & 0.449 & 0.87 \\
+        6 & sum & 0.107 & 0.076 & 0.71 & 0.180 & 0.169 & 0.94 \\
+        6 & max & 0.096 & 0.062 & 0.64 & 0.338 & 0.181 & 0.54 \\
+        6 & min & 0.097 & 0.068 & 0.71 & 0.333 & 0.184 & 0.55 \\
+        8 & prod & 0.110 & 0.106 & 0.96 & 0.523 & 0.461 & 0.88 \\
+        8 & sum & 0.102 & 0.076 & 0.75 & 0.168 & 0.170 & 1.01 \\
+        8 & max & 0.087 & 0.065 & 0.74 & 0.343 & 0.192 & 0.56 \\
+        8 & min & 0.092 & 0.065 & 0.70 & 0.334 & 0.178 & 0.53 \\
+        10 & prod & 0.126 & 0.105 & 0.83 & 0.543 & 0.450 & 0.83 \\
+        10 & sum & 0.139 & 0.093 & 0.67 & 0.163 & 0.170 & 1.04 \\
+        10 & max & 0.088 & 0.062 & 0.71 & 0.351 & 0.193 & 0.55 \\
+        10 & min & 0.089 & 0.070 & 0.79 & 0.336 & 0.181 & 0.54 \\
+        14 & prod & 0.142 & 0.105 & 0.74 & 0.536 & 0.472 & 0.88 \\
+        14 & sum & 0.140 & 0.079 & 0.56 & 0.162 & 0.175 & 1.08 \\
+        14 & max & 0.091 & 0.069 & 0.75 & 0.340 & 0.208 & 0.61 \\
+        14 & min & 0.108 & 0.064 & 0.59 & 0.356 & 0.276 & 0.78 \\
+        20 & prod & 0.188 & 0.107 & 0.57 & 0.669 & 0.470 & 0.70 \\
+        20 & sum & 0.115 & 0.074 & 0.64 & 0.158 & 0.177 & 1.12 \\
+        20 & max & 0.160 & 0.065 & 0.41 & 0.342 & 0.198 & 0.58 \\
+        20 & min & 0.170 & 0.076 & 0.45 & 0.335 & 0.186 & 0.56 \\
+        30 & prod & 0.225 & 0.082 & 0.37 & 0.738 & 0.544 & 0.74 \\
+        30 & sum & 0.122 & 0.085 & 0.70 & 0.167 & 0.217 & 1.30 \\
+        30 & max & 0.101 & 0.073 & 0.72 & 0.384 & 0.186 & 0.48 \\
+        30 & min & 0.097 & 0.068 & 0.70 & 0.382 & 0.196 & 0.51 \\
+        50 & prod & 0.255 & 0.088 & 0.34 & 0.930 & 0.594 & 0.64 \\
+        50 & sum & 0.101 & 0.078 & 0.77 & 0.165 & 0.187 & 1.13 \\
+        50 & max & 0.093 & 0.091 & 0.98 & 0.382 & 0.177 & 0.46 \\
+        50 & min & 0.095 & 0.072 & 0.75 & 0.389 & 0.180 & 0.46 \\
+        4 & prod & 0.087 & 0.054 & 0.63 & 0.560 & 0.504 & 0.90 \\
+        4 & sum & 0.115 & 0.059 & 0.52 & 0.153 & 0.146 & 0.95 \\
+        4 & max & 0.086 & 0.106 & 1.23 & 0.355 & 0.179 & 0.50 \\
+        4 & min & 0.086 & 0.111 & 1.30 & 0.357 & 0.195 & 0.55 \\
+        6 & prod & 0.109 & 0.058 & 0.53 & 0.601 & 0.552 & 0.92 \\
+        6 & sum & 0.150 & 0.069 & 0.46 & 0.170 & 0.150 & 0.88 \\
+        6 & max & 0.094 & 0.133 & 1.42 & 0.370 & 0.220 & 0.59 \\
+        6 & min & 0.088 & 0.132 & 1.50 & 0.357 & 0.222 & 0.62 \\
+        8 & prod & 0.158 & 0.074 & 0.47 & 0.715 & 0.656 & 0.92 \\
+        8 & sum & 0.104 & 0.068 & 0.66 & 0.223 & 0.208 & 0.93 \\
+        8 & max & 0.148 & 0.143 & 0.96 & 0.385 & 0.286 & 0.74 \\
+        8 & min & 0.141 & 0.135 & 0.96 & 0.393 & 0.278 & 0.71 \\
+        10 & prod & 0.112 & 0.068 & 0.61 & 0.604 & 0.742 & 1.23 \\
+        10 & sum & 0.101 & 0.065 & 0.65 & 0.181 & 0.258 & 1.42 \\
+        10 & max & 0.096 & 0.130 & 1.34 & 0.405 & 0.261 & 0.64 \\
+        10 & min & 0.103 & 0.129 & 1.26 & 0.393 & 0.283 & 0.72 \\
+        14 & prod & 0.175 & 0.084 & 0.48 & 0.820 & 0.751 & 0.92 \\
+        14 & sum & 0.125 & 0.089 & 0.72 & 0.228 & 0.295 & 1.29 \\
+        14 & max & 0.196 & 0.154 & 0.78 & 0.537 & 0.408 & 0.76 \\
+        14 & min & 0.133 & 0.145 & 1.10 & 0.410 & 0.328 & 0.80 \\
+        20 & prod & 0.363 & 0.128 & 0.35 & 1.377 & 0.967 & 0.70 \\
+        20 & sum & 0.133 & 0.127 & 0.95 & 0.283 & 0.378 & 1.33 \\
+        20 & max & 0.205 & 0.183 & 0.89 & 0.617 & 0.494 & 0.80 \\
+        20 & min & 0.208 & 0.180 & 0.87 & 0.639 & 0.482 & 0.75 \\
+        30 & prod & 0.685 & 0.186 & 0.27 & 2.806 & 1.160 & 0.41 \\
+        30 & sum & 0.174 & 0.186 & 1.07 & 0.447 & 0.587 & 1.31 \\
+        30 & max & 0.350 & 0.245 & 0.70 & 0.979 & 0.692 & 0.71 \\
+        30 & min & 0.356 & 0.238 & 0.67 & 0.954 & 0.651 & 0.68 \\
+        50 & prod & 1.696 & 0.310 & 0.18 & 6.463 & 1.703 & 0.26 \\
+        50 & sum & 0.350 & 0.301 & 0.86 & 0.807 & 1.035 & 1.28 \\
+        50 & max & 0.720 & 0.370 & 0.51 & 1.741 & 1.128 & 0.65 \\
+        50 & min & 0.656 & 0.437 & 0.67 & 1.729 & 1.097 & 0.63 \\
+        4 & prod & 0.381 & 0.236 & 0.62 & 2.045 & 1.481 & 0.72 \\
+        4 & sum & 0.220 & 0.253 & 1.15 & 0.602 & 0.798 & 1.33 \\
+        4 & max & 0.343 & 0.864 & 2.52 & 1.254 & 1.445 & 1.15 \\
+        4 & min & 0.362 & 0.866 & 2.40 & 1.290 & 1.435 & 1.11 \\
+        6 & prod & 0.561 & 0.382 & 0.68 & 3.439 & 2.080 & 0.60 \\
+        6 & sum & 0.372 & 0.403 & 1.08 & 1.107 & 1.307 & 1.18 \\
+        6 & max & 0.565 & 1.008 & 1.78 & 1.973 & 2.028 & 1.03 \\
+        6 & min & 0.552 & 1.012 & 1.83 & 2.055 & 2.024 & 0.98 \\
+        8 & prod & 0.865 & 0.634 & 0.73 & 4.708 & 2.854 & 0.61 \\
+        8 & sum & 0.591 & 0.586 & 0.99 & 1.669 & 1.865 & 1.12 \\
+        8 & max & 0.768 & 1.281 & 1.67 & 2.937 & 2.806 & 0.96 \\
+        8 & min & 0.863 & 1.312 & 1.52 & 3.102 & 2.630 & 0.85 \\
+        10 & prod & 1.199 & 0.807 & 0.67 & 5.934 & 3.537 & 0.60 \\
+        10 & sum & 0.715 & 0.812 & 1.14 & 2.211 & 2.497 & 1.13 \\
+        10 & max & 1.064 & 1.389 & 1.30 & 3.731 & 3.269 & 0.88 \\
+        10 & min & 1.052 & 1.456 & 1.38 & 3.773 & 3.322 & 0.88 \\
+        14 & prod & 2.093 & 1.312 & 0.63 & 10.128 & 7.008 & 0.69 \\
+        14 & sum & 1.223 & 1.379 & 1.13 & 3.798 & 4.353 & 1.15 \\
+        14 & max & 1.915 & 1.936 & 1.01 & 6.464 & 5.815 & 0.90 \\
+        14 & min & 1.986 & 2.049 & 1.03 & 6.659 & 5.130 & 0.77 \\
+        20 & prod & 3.890 & 2.154 & 0.55 & 17.351 & 8.078 & 0.47 \\
+        20 & sum & 1.952 & 2.229 & 1.14 & 6.033 & 7.125 & 1.18 \\
+        20 & max & 2.846 & 2.754 & 0.97 & 9.609 & 7.851 & 0.82 \\
+        20 & min & 2.963 & 2.780 & 0.94 & 9.398 & 7.988 & 0.85 \\
+        30 & prod & 8.621 & 3.379 & 0.39 & 32.975 & 13.753 & 0.42 \\
+        30 & sum & 3.288 & 3.465 & 1.05 & 10.192 & 10.810 & 1.06 \\
+        30 & max & 4.989 & 4.026 & 0.81 & 15.902 & 12.730 & 0.80 \\
+        30 & min & 5.157 & 4.024 & 0.78 & 15.757 & 12.066 & 0.77 \\
+        50 & prod & 19.755 & 6.118 & 0.31 & 72.917 & 24.071 & 0.33 \\
+        50 & sum & 5.955 & 6.000 & 1.01 & 18.071 & 19.682 & 1.09 \\
+        50 & max & 9.299 & 6.683 & 0.72 & 27.755 & 20.266 & 0.73 \\
+        50 & min & 9.072 & 7.037 & 0.78 & 28.508 & 21.342 & 0.75 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Weighted Speedups (Based on Real Circuit Distributions)}
+
+The following speedups are weighted by the actual computation distribution from real SDD circuits (Table~\ref{tab:circuit_stats}), where each fan-in value contributes proportionally to its share of total circuit computation.
+
+\begin{table}[H]
+\centering
+\caption{Weighted Average Speedups Based on Real Circuit Fan-in Distribution}
+\label{tab:weighted_speedups}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Device} & \textbf{prod} & \textbf{sum} & \textbf{max} & \textbf{min} \\
+\midrule
+CPU (fwd/bwd) & 0.21x / 0.24x & 0.41x / 0.77x & 0.29x / 0.33x & 0.24x / 0.32x \\
+MPS (fwd/bwd) & 0.55x / 0.54x & 1.08x / 1.15x & 1.31x / 0.90x & 1.30x / 0.87x \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Interpretation}: Values below 1.0x indicate the general approach is faster. For example, 0.21x means the general approach is 4.8$\times$ faster than \texttt{scatter\_reduce}.
+
+
+\subsection{Visualization}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{benchmark_plots.pdf}
+    \caption{Speedup comparison across scales. \textbf{Top row}: Forward pass. \textbf{Bottom row}: Backward pass. The dashed line at $y=1$ indicates break-even; values below 1 indicate the general approach is faster. Note the log scale on the x-axis.}
+    \label{fig:plots}
+\end{figure}
+
+\section{Analysis}
+
+\subsection{CPU Performance}
+
+On CPU, the general approach consistently outperforms \texttt{scatter\_reduce} for \textbf{prod}, \textbf{max}, and \textbf{min} operations:
+
+\begin{table}[H]
+\centering
+\caption{CPU Speedup at Largest Configuration (100,000 outputs)}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Operation & Forward Speedup & Backward Speedup & Forward Time (gen) & Backward Time (gen) \\
+\midrule
+prod & 0.31x & 0.24x & 12.4 ms & 39.2 ms \\
+sum & 0.54x & 0.81x & 12.7 ms & 35.0 ms \\
+max & 0.30x & 0.35x & 13.5 ms & 36.2 ms \\
+min & 0.30x & 0.35x & 14.3 ms & 36.7 ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key observations}:
+\begin{itemize}
+    \item \textbf{prod}: General approach is 2--5$\times$ faster in forward pass, 3--4$\times$ faster in backward pass
+    \item \textbf{max/min}: Similar speedups (2--4$\times$) due to regular memory access patterns
+    \item \textbf{sum}: Nearly equivalent performance; \texttt{scatter\_reduce} sum is well-optimized
+    \item \textbf{Backward pass}: Often shows larger speedups than forward pass
+\end{itemize}
+
+\subsection{MPS (Apple Silicon GPU) Performance}
+
+GPU results show more nuanced behavior:
+
+\begin{table}[H]
+\centering
+\caption{MPS Speedup at Largest Configuration (100,000 outputs)}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Operation & Forward Speedup & Backward Speedup & Forward Time (gen) & Backward Time (gen) \\
+\midrule
+prod & 0.31x & 0.33x & 6.1 ms & 24.1 ms \\
+sum & 1.01x & 1.09x & 6.0 ms & 19.7 ms \\
+max & 0.72x & 0.73x & 6.7 ms & 20.3 ms \\
+min & 0.78x & 0.75x & 7.0 ms & 21.3 ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key observations}:
+\begin{itemize}
+    \item \textbf{prod}: General approach is consistently faster (1.2--1.4$\times$) on forward and backward
+    \item \textbf{sum}: Roughly equivalent; slight edge to \texttt{scatter\_reduce}
+    \item \textbf{max/min}: \texttt{scatter\_reduce} is \textit{faster} in forward pass (0.8--0.9$\times$) but general is faster in backward
+    \item GPU kernel characteristics and memory bandwidth affect results differently than CPU
+\end{itemize}
+
+\subsection{Why is the General Approach Faster?}
+
+\begin{enumerate}
+    \item \textbf{Regular memory access patterns}: The 2D scattered tensor has contiguous memory layout, enabling:
+    \begin{itemize}
+        \item Better CPU cache utilization
+        \item Vectorized SIMD operations
+        \item Predictable memory prefetching
+    \end{itemize}
+    
+    \item \textbf{Highly optimized reduction kernels}: PyTorch's \texttt{torch.prod}, \texttt{torch.max}, etc. are heavily optimized for contiguous tensors.
+    
+    \item \textbf{Parallelization}: Reduction along dim=1 of a 2D tensor parallelizes naturally across rows.
+    
+    \item \textbf{\texttt{scatter\_reduce} overhead}:
+    \begin{itemize}
+        \item Must handle variable group sizes
+        \item Irregular memory access patterns
+        \item Atomic operations or synchronization for thread safety
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Memory Trade-offs}
+
+The general approach requires additional memory:
+\begin{equation}
+\text{Memory}_{\text{general}} = n_{\text{outputs}} \times \text{max\_fan\_in} \times \text{sizeof(dtype)}
+\end{equation}
+
+For our benchmarks with fan-in = 10 and float32:
+\begin{itemize}
+    \item $10^4$ outputs: 400 KB
+    \item $10^5$ outputs: 4 MB
+    \item $10^6$ outputs: 40 MB
+\end{itemize}
+
+This is typically acceptable given modern memory capacities, but may be prohibitive for:
+\begin{itemize}
+    \item Very high fan-in (hundreds of inputs per output)
+    \item Memory-constrained environments
+    \item Extremely large output dimensions
+\end{itemize}
+
+\section{Recommendations}
+
+\subsection{When to Use Each Approach}
+
+\begin{table}[H]
+\centering
+\caption{Decision Guide}
+\begin{tabular}{@{}p{0.45\textwidth}p{0.45\textwidth}@{}}
+\toprule
+\textbf{Use \texttt{scatter\_reduce} when:} & \textbf{Use General Approach when:} \\
+\midrule
+Memory efficiency is critical & Performance is the primary concern \\
+Very small problem sizes ($n_{\text{out}} < 500$) & Medium to large scales ($n_{\text{out}} > 1000$) \\
+Highly variable fan-in per output & Uniform or bounded fan-in \\
+Single forward pass (no gradients) & Training with backward passes \\
+ & Custom reduction functions (logsumexp, softmax, learned) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Implementation Checklist}
+
+For optimal general approach performance:
+\begin{enumerate}
+    \item Pre-compute group positions once during setup
+    \item Pre-allocate the scattered buffer and reuse across calls
+    \item Use \texttt{@torch.jit.script} for reduced Python overhead
+    \item Ensure contiguous memory layout
+\end{enumerate}
+
+\section{Conclusion}
+
+Our benchmarks demonstrate that a general scatter-then-reduce approach, with proper buffer pre-allocation, provides \textbf{significant performance advantages} over PyTorch's fused \texttt{scatter\_reduce} operation:
+
+\begin{itemize}
+    \item \textbf{CPU}: 2--5$\times$ faster for prod/max/min at large scales
+    \item \textbf{GPU (MPS)}: 1.2--1.4$\times$ faster for prod; mixed results for max/min
+    \item \textbf{Backward pass}: Often shows even larger speedups than forward pass
+\end{itemize}
+
+The performance advantage stems from regular memory access patterns that enable better vectorization and cache utilization. The trade-off is increased memory usage proportional to $n_{\text{outputs}} \times \text{max\_fan\_in}$.
+
+For applications requiring custom reductions (e.g., log-sum-exp for probabilistic circuits) or maximum throughput at scale, the general approach is strongly recommended.
+
+\end{document}

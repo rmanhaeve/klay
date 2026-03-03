@@ -5,6 +5,7 @@
 *.txt
 *.cnf
 *.nnf
+*.png
 build
 .DS_Store
 .vscode
@@ -13,4 +14,14 @@ cmake-build-debug
 .venv
 tmp
 data
-_build
+
+# LaTeX intermediates
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
