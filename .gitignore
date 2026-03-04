@@ -25,3 +25,4 @@ data
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+/uv.lock
