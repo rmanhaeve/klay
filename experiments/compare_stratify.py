@@ -1,5 +1,5 @@
 """
-Compare Python stratification with C++ klay implementation.
+Compare stratification implementations.
 
 Usage:
     python compare_stratify.py <nnf_file>   # Compare on a specific NNF file
@@ -9,86 +9,125 @@ Usage:
 import sys
 from pathlib import Path
 
-from stratify import Circuit as PyCircuit
+from stratify import Circuit as AlternatingCircuit
+from stratify_parallel import ParallelCircuit
 
 try:
     import klay
     KLAY_AVAILABLE = True
 except ImportError:
     KLAY_AVAILABLE = False
-    print("Warning: klay C++ module not available, will only show Python results")
+    print("Warning: klay C++ module not available")
 
 
-def compare_d4_file(nnf_file: str):
-    """Compare layer counts between C++ and Python on a D4 NNF file."""
-    print(f"=== Comparing on {nnf_file} ===")
+def compare_file(filename: str):
+    """Compare alternating vs parallel stratification on an SDD or D4 file."""
+    print(f"=== Comparing on {filename} ===\n")
 
-    # Python implementation
-    py_circuit = PyCircuit()
-    py_circuit.add_d4_from_file(nnf_file)
-    py_nodes_before = py_circuit.nb_nodes()
-    py_layers_before = py_circuit.nb_layers()
-    py_layer_sizes_before = py_circuit.layer_sizes()
+    is_sdd = filename.endswith(".sdd")
 
-    py_indices, py_csr = py_circuit.get_indices()
-    py_layers = len(py_indices) + 1
-    py_layer_sizes = [len(csr) - 1 for csr in py_csr]
+    # Alternating (original) implementation
+    alt_circuit = AlternatingCircuit()
+    if is_sdd:
+        alt_circuit.add_sdd_from_file(filename)
+    else:
+        alt_circuit.add_d4_from_file(filename)
+    alt_nodes_before = alt_circuit.nb_nodes()
+    alt_layers_before = alt_circuit.nb_layers()
 
-    print(f"Py  nodes (before get_indices): {py_nodes_before}")
-    print(f"Py  layers (before): {py_layers_before}, sizes: {py_layer_sizes_before}")
-    print(f"Py  layers (after):  {py_layers}, sizes: {py_layer_sizes}")
+    alt_indices, alt_csr = alt_circuit.get_indices()
+    alt_layers = len(alt_indices) + 1
+    alt_layer_sizes = [len(csr) - 1 for csr in alt_csr]
 
+    print("ALTERNATING (original):")
+    print(f"  Nodes (before finalize): {alt_nodes_before}")
+    print(f"  Layers (before): {alt_layers_before}")
+    print(f"  Layers (after):  {alt_layers}")
+    print(f"  Max layer width: {max(alt_layer_sizes)}")
+    print(f"  Layer sizes: {alt_layer_sizes[:10]}{'...' if len(alt_layer_sizes) > 10 else ''}")
+    print()
+
+    # Parallel implementation
+    par_circuit = ParallelCircuit()
+    if is_sdd:
+        par_circuit.add_sdd_from_file(filename)
+    else:
+        par_circuit.add_d4_from_file(filename)
+    par_nodes_before = par_circuit.nb_nodes()
+    par_ranks_before = par_circuit.nb_ranks()
+
+    par_indices = par_circuit.get_indices()
+    par_ranks = par_circuit.nb_ranks()
+    
+    # Compute totals and max width per rank
+    par_rank_totals = []
+    par_max_width = 0
+    for i in range(len(par_indices['and'])):
+        and_count = len(par_indices['and'][i][1]) - 1
+        or_count = len(par_indices['or'][i][1]) - 1
+        par_rank_totals.append((and_count, or_count))
+        par_max_width = max(par_max_width, and_count + or_count)
+
+    print("PARALLEL (new):")
+    print(f"  Nodes (before finalize): {par_nodes_before}")
+    print(f"  Ranks (before): {par_ranks_before}")
+    print(f"  Ranks (after):  {par_ranks}")
+    print(f"  Max rank width: {par_max_width}")
+    print(f"  Rank sizes (and, or): {par_rank_totals[:10]}{'...' if len(par_rank_totals) > 10 else ''}")
+    print()
+
+    # Summary comparison
+    alt_total_ops = sum(alt_layer_sizes)
+    par_total_ops = sum(a + o for a, o in par_rank_totals)
+    
+    print("COMPARISON:")
+    print(f"  Alternating: {alt_layers} layers, {alt_total_ops} total nodes (excl. input)")
+    print(f"  Parallel:    {par_ranks} ranks, {par_total_ops} total nodes (excl. input)")
+    print(f"  Rank reduction: {alt_layers} -> {par_ranks} ({alt_layers - par_ranks} fewer)")
+    print(f"  Node reduction: {alt_total_ops} -> {par_total_ops} ({alt_total_ops - par_total_ops} fewer)")
+    
+    # C++ comparison
     if KLAY_AVAILABLE:
-        # C++ implementation
         cpp_circuit = klay.Circuit()
-        cpp_circuit.add_d4_from_file(nnf_file)
-        cpp_nodes = cpp_circuit.nb_nodes()
-
+        if is_sdd:
+            cpp_circuit.add_sdd_from_file(filename)
+        else:
+            cpp_circuit.add_d4_from_file(filename)
         cpp_indices, cpp_csr = cpp_circuit._get_indices()
         cpp_layers = len(cpp_indices) + 1
         cpp_layer_sizes = [len(csr) - 1 for csr in cpp_csr]
-
-        print(f"C++ nodes: {cpp_nodes}")
-        print(f"C++ layers: {cpp_layers}, sizes: {cpp_layer_sizes}")
-
-        match = (cpp_layers == py_layers) and (cpp_layer_sizes == py_layer_sizes)
-        print(f"Match: {'✓' if match else '✗'}")
-        return match
+        
+        alt_match = (alt_layers == cpp_layers) and (alt_layer_sizes == cpp_layer_sizes)
+        print(f"\n  Alternating matches C++: {'✓' if alt_match else '✗'}")
 
     return True
 
 
-def compare_random(nb_vars: int, seed: int = 0):
-    """Generate random CNF, compile with D4, and compare."""
-    from klay.utils import generate_random_dimacs
-    from klay.compile import compile_d4
-
-    cnf_file = "/tmp/compare_test.cnf"
-    nnf_file = "/tmp/compare_test.nnf"
-
-    generate_random_dimacs(cnf_file, nb_vars, 2 * nb_vars, seed=seed)
-    compile_d4(cnf_file, nnf_file)
-
-    return compare_d4_file(nnf_file)
+def compare_nesy_circuits():
+    """Compare on all nesy benchmark circuits."""
+    circuits = ["sudoku_4", "4-grid", "seq_fun", "warcraft_12"]
+    
+    results = []
+    for name in circuits:
+        sdd_file = f"nesy/circuits/{name}.sdd"
+        print(f"\n{'='*60}")
+        compare_file(sdd_file)
+        results.append(name)
+    
+    return results
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("nnf_file", nargs="?", help="D4 NNF file to compare")
-    parser.add_argument("-v", "--nb_vars", type=int, default=10)
-    parser.add_argument("-s", "--seed", type=int, default=0)
-    parser.add_argument("-n", "--num_tests", type=int, default=1)
+    parser.add_argument("file", nargs="?", help="SDD or NNF file to compare")
+    parser.add_argument("--nesy", action="store_true", help="Compare all nesy circuits")
     args = parser.parse_args()
 
-    if args.nnf_file:
-        success = compare_d4_file(args.nnf_file)
-        sys.exit(0 if success else 1)
+    if args.nesy:
+        compare_nesy_circuits()
+    elif args.file:
+        compare_file(args.file)
     else:
-        all_match = True
-        for seed in range(args.seed, args.seed + args.num_tests):
-            print(f"\n--- Test seed={seed} ---")
-            if not compare_random(args.nb_vars, seed):
-                all_match = False
-        sys.exit(0 if all_match else 1)
+        parser.print_help()

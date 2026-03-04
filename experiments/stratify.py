@@ -379,6 +379,73 @@ class Circuit:
         self.roots.append(root)
         return root
 
+    def add_sdd_from_file(
+        self,
+        filename: str,
+        true_lits: list[int] | None = None,
+        false_lits: list[int] | None = None,
+    ) -> Node:
+        """
+        Parse an SDD file and add nodes to the circuit.
+        Returns the root node.
+        """
+        true_lits = true_lits or []
+        false_lits = false_lits or []
+
+        node_ids: list[Node | None] = []
+
+        with open(filename) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("c"):
+                    continue
+
+                parts = line.split()
+                node_type = parts[0]
+
+                if node_type == "sdd":
+                    nb_nodes = int(parts[1])
+                    node_ids = [None] * nb_nodes
+                    continue
+
+                node_id = int(parts[1])
+
+                if node_type == "F":
+                    node = create_false_node()
+                elif node_type == "T":
+                    node = create_true_node()
+                elif node_type == "L":
+                    # L id vtree literal
+                    literal = int(parts[3])
+                    if literal in true_lits:
+                        node = create_true_node()
+                    elif literal in false_lits:
+                        node = create_false_node()
+                    else:
+                        node = create_literal_node(literal)
+                elif node_type == "D":
+                    # D id vtree num_elements {prime_id sub_id}*
+                    num_elements = int(parts[3])
+                    node = create_or_node()
+                    for i in range(num_elements):
+                        prime_id = int(parts[4 + 2 * i])
+                        sub_id = int(parts[5 + 2 * i])
+                        and_node = create_and_node()
+                        and_node.add_child(node_ids[prime_id])
+                        and_node.add_child(node_ids[sub_id])
+                        and_node = self.add_node_level_compressed(and_node)
+                        node.add_child(and_node)
+                else:
+                    raise ValueError(f"Unknown node type: {node_type}")
+
+                node = self.add_node_level_compressed(node)
+                node_ids[node_id] = node
+
+        # Last parsed node is the root (node_id 0 is typically last in SDD files)
+        root = node
+        self.roots.append(root)
+        return root
+
     def layer_sizes(self) -> list[int]:
         """Return number of nodes per layer."""
         return [len(layer) for layer in self.layers]
